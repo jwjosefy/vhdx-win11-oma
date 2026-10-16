@@ -1,0 +1,24 @@
+# Configuração do mount-media-vhdx.
+# Copie para /etc/media-vhdx.conf e ajuste para a sua máquina.
+# Descomente só o que for diferente do padrão.
+
+# Partição NTFS do Windows. Prefira o caminho por UUID, que não muda
+# entre boots (descubra com: lsblk -f ou ls -l /dev/disk/by-uuid/).
+#WIN_PART="/dev/disk/by-uuid/5E68702E68700755"
+#WIN_PART="/dev/nvme0n1p3"
+
+# Onde a partição do Windows é montada.
+#WIN_MNT="/mnt/win11"
+
+# Caminho do VHDX relativo à raiz da partição do Windows.
+# No Windows, C:\files\MEDIA-DISK.vhdx vira files/MEDIA-DISK.vhdx.
+#VHDX_PATH="files/MEDIA-DISK.vhdx"
+
+# Onde o disco de dentro do VHDX é montado.
+#MEDIA_MNT="/mnt/media-vhdx"
+
+# Dispositivo NBD usado para conectar o VHDX.
+#NBD="/dev/nbd0"
+
+# Usuário dono dos arquivos montados (descubra com: id -u).
+#MEDIA_UID=1000

@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# Mount the Windows NTFS partition read-write, then mount its VHDX read-write.
+set -Eeuo pipefail
+
+# Defaults; override them in /etc/media-vhdx.conf (see media-vhdx.conf.example).
+WIN_PART="/dev/nvme0n1p3"
+WIN_MNT="/mnt/win11"
+VHDX_PATH="files/MEDIA-DISK.vhdx"
+MEDIA_MNT="/mnt/media-vhdx"
+NBD="/dev/nbd0"
+CONFIG_FILE="/etc/media-vhdx.conf"
+if [[ -r "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+# Resolve /dev/disk/by-uuid/... links so they match what findmnt reports.
+WIN_PART="$(readlink -f -- "$WIN_PART")"
+readonly WIN_PART WIN_MNT MEDIA_MNT NBD
+readonly VHDX="${WIN_MNT}/${VHDX_PATH}"
+readonly NBD_NAME="${NBD##*/}"
+readonly SERVICE="media-vhdx.service"
+readonly LOCK_FILE="/run/lock/mount-media-vhdx.lock"
+
+usage() {
+  cat <<EOF
+Monta a partição do Win11 e o VHDX de mídia em leitura e escrita.
+
+Uso:
+  $0           Monta a partição do Windows e o VHDX
+  $0 --umount  Desmonta o VHDX e a partição do Windows
+
+Se $SERVICE estiver instalado, a montagem passa pelo systemd, que
+desmonta tudo com segurança no desligamento.
+EOF
+}
+
+mode="mount"
+as_root=false
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage; exit 0 ;;
+    --umount) mode="umount" ;;
+    --root) as_root=true ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+service_installed() {
+  [[ "$(systemctl show -P LoadState "$SERVICE" 2>/dev/null)" == "loaded" ]]
+}
+
+# Without --root, delegate: through the systemd service when installed,
+# otherwise by re-running this script as root.
+if [[ "$as_root" != true ]]; then
+  sudo_cmd=()
+  if (( EUID != 0 )); then
+    command -v sudo >/dev/null || { echo "Erro: sudo não está instalado." >&2; exit 1; }
+    sudo_cmd=(sudo)
+  fi
+
+  show_service_log() {
+    echo "Saída do $SERVICE:" >&2
+    "${sudo_cmd[@]}" journalctl -u "$SERVICE" -n 20 --no-pager -o cat --since "-2min" >&2 || true
+  }
+
+  if service_installed; then
+    if [[ "$mode" == "mount" ]]; then
+      if ! "${sudo_cmd[@]}" systemctl start "$SERVICE"; then
+        show_service_log
+        exit 1
+      fi
+      echo "VHDX montado como leitura e escrita em $MEDIA_MNT (via $SERVICE)."
+      echo "Para desmontar: $0 --umount"
+      exit 0
+    fi
+    if systemctl is-active --quiet "$SERVICE"; then
+      if ! "${sudo_cmd[@]}" systemctl stop "$SERVICE"; then
+        show_service_log
+        exit 1
+      fi
+      echo "Desmontado: $MEDIA_MNT e $WIN_MNT (via $SERVICE)."
+      exit 0
+    fi
+    # Service inactive: something may have been mounted by hand, clean it up directly.
+  fi
+
+  self="$(readlink -f -- "$0")"
+  if [[ "$mode" == "umount" ]]; then
+    exec "${sudo_cmd[@]}" "$self" --root --umount
+  else
+    exec "${sudo_cmd[@]}" "$self" --root
+  fi
+fi
+
+if (( EUID != 0 )); then
+  echo "Erro: --root precisa ser executado como root." >&2
+  exit 1
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  echo "Erro: outra execução de $(basename "$0") já está em andamento." >&2
+  exit 1
+fi
+
+user_uid="${MEDIA_UID:-${SUDO_UID:-1000}}"
+user_gid="$(getent passwd "$user_uid" | awk -F: '{print $4}')"
+if [[ -z "$user_gid" ]]; then
+  echo "Erro: não consegui determinar o grupo do usuário UID $user_uid." >&2
+  exit 1
+fi
+readonly MOUNT_OPTS="rw,noatime,uid=$user_uid,gid=$user_gid,umask=0022"
+
+mounted_source() {
+  findmnt -rn -M "$1" -o SOURCE 2>/dev/null || true
+}
+
+is_mounted() {
+  findmnt -rn -M "$1" >/dev/null 2>&1
+}
+
+is_rw() {
+  [[ ",$(findmnt -rn -M "$1" -o OPTIONS 2>/dev/null)," == *,rw,* ]]
+}
+
+nbd_connected() {
+  [[ -r "/sys/block/$NBD_NAME/pid" ]] && [[ "$(< "/sys/block/$NBD_NAME/pid")" != "0" ]]
+}
+
+windows_hint() {
+  echo "Causa provável: o Windows foi hibernado ou desligado com a Inicialização Rápida ativa." >&2
+  echo "Entre no Windows e desligue com: shutdown /s /t 0" >&2
+}
+
+if [[ "$mode" == "umount" ]]; then
+  media_was_mounted=false
+  if is_mounted "$MEDIA_MNT"; then
+    media_source="$(mounted_source "$MEDIA_MNT")"
+    if [[ "$media_source" != "$NBD" && ! "$media_source" =~ ^${NBD}p[0-9]+$ ]]; then
+      echo "Erro: $MEDIA_MNT está montado a partir de $media_source; não vou desmontá-lo." >&2
+      exit 1
+    fi
+    if ! umount "$MEDIA_MNT"; then
+      echo "Erro: $MEDIA_MNT está em uso. Processos usando o disco:" >&2
+      fuser -vm "$MEDIA_MNT" >&2 || true
+      exit 1
+    fi
+    media_was_mounted=true
+    echo "Desmontado: $MEDIA_MNT"
+  fi
+
+  if nbd_connected; then
+    if [[ "$media_was_mounted" != true ]]; then
+      echo "Erro: $NBD está conectado, mas $MEDIA_MNT não está montado; não vou desconectar um NBD que pode pertencer a outra imagem." >&2
+      exit 1
+    fi
+    qemu-nbd --disconnect "$NBD" >/dev/null
+  fi
+
+  if is_mounted "$WIN_MNT"; then
+    win_source="$(mounted_source "$WIN_MNT")"
+    if [[ "$win_source" != "$WIN_PART" ]]; then
+      echo "Erro: $WIN_MNT está montado a partir de $win_source; não vou desmontá-lo." >&2
+      exit 1
+    fi
+    umount "$WIN_MNT"
+    echo "Desmontado: $WIN_MNT"
+  fi
+  exit 0
+fi
+
+if is_mounted "$MEDIA_MNT"; then
+  echo "Erro: $MEDIA_MNT já está montado. Use --umount antes de montar novamente." >&2
+  exit 1
+fi
+
+# On any failure, undo only what this run set up.
+success=false
+win_mounted_by_us=false
+nbd_connected_by_us=false
+media_mounted_by_us=false
+cleanup() {
+  [[ "$success" == true ]] && return
+  if [[ "$media_mounted_by_us" == true ]]; then umount "$MEDIA_MNT" || true; fi
+  if [[ "$nbd_connected_by_us" == true ]]; then qemu-nbd --disconnect "$NBD" >/dev/null 2>&1 || true; fi
+  if [[ "$win_mounted_by_us" == true ]]; then umount "$WIN_MNT" || true; fi
+}
+trap cleanup EXIT
+
+mkdir -p "$WIN_MNT" "$MEDIA_MNT"
+
+if is_mounted "$WIN_MNT"; then
+  win_source="$(mounted_source "$WIN_MNT")"
+  if [[ "$win_source" != "$WIN_PART" ]]; then
+    echo "Erro: $WIN_MNT está montado a partir de $win_source, esperado $WIN_PART." >&2
+    exit 1
+  fi
+  if ! is_rw "$WIN_MNT"; then
+    echo "$WIN_MNT está montado somente leitura; desmontando para montar com escrita..."
+    umount "$WIN_MNT"
+  fi
+fi
+
+if ! is_mounted "$WIN_MNT"; then
+  echo "Montando $WIN_PART em $WIN_MNT como leitura e escrita..."
+  if ! mount -t ntfs3 -o "$MOUNT_OPTS" "$WIN_PART" "$WIN_MNT"; then
+    echo "Erro: não consegui montar $WIN_PART com escrita." >&2
+    windows_hint
+    exit 1
+  fi
+  win_mounted_by_us=true
+fi
+
+if ! is_rw "$WIN_MNT"; then
+  echo "Erro: $WIN_MNT ficou somente leitura." >&2
+  windows_hint
+  exit 1
+fi
+
+if [[ ! -f "$VHDX" ]]; then
+  echo "Erro: não encontrei o VHDX em $VHDX." >&2
+  exit 1
+fi
+
+if ! command -v qemu-nbd >/dev/null 2>&1; then
+  echo "Erro: qemu-nbd não encontrado. Instale o pacote qemu-img." >&2
+  exit 1
+fi
+
+modprobe nbd max_part=8
+if [[ "$(< /sys/module/nbd/parameters/max_part)" -lt 1 ]]; then
+  echo "Erro: o módulo nbd está carregado sem suporte a partições (max_part=0)." >&2
+  echo "Desconecte os dispositivos NBD em uso e carregue o módulo com: modprobe -r nbd; modprobe nbd max_part=8" >&2
+  exit 1
+fi
+
+if nbd_connected; then
+  echo "Erro: $NBD já está conectado a outra imagem; não vou reutilizá-lo." >&2
+  exit 1
+fi
+
+echo "Conectando o VHDX em $NBD..."
+# Close the lock fd so the qemu-nbd daemon does not keep holding the lock.
+qemu-nbd --format=vhdx --connect="$NBD" "$VHDX" 9>&-
+nbd_connected_by_us=true
+partx --add "$NBD" >/dev/null 2>&1 || true
+
+# Partition devices can show up a moment after the connect returns.
+partitions=()
+for _ in {1..10}; do
+  udevadm settle --timeout=5 || true
+  mapfile -t partitions < <(lsblk -lnpo NAME,TYPE "$NBD" | awk '$2 == "part" {print $1}')
+  if (( ${#partitions[@]} > 0 )) || [[ "$(blkid -s TYPE -o value "$NBD" 2>/dev/null || true)" == "ntfs" ]]; then
+    break
+  fi
+  sleep 0.5
+done
+
+ntfs_partitions=()
+for partition in "${partitions[@]}"; do
+  if [[ "$(blkid -s TYPE -o value "$partition" 2>/dev/null || true)" == "ntfs" ]]; then
+    ntfs_partitions+=("$partition")
+  fi
+done
+
+if (( ${#ntfs_partitions[@]} == 1 )); then
+  filesystem_device="${ntfs_partitions[0]}"
+elif (( ${#ntfs_partitions[@]} > 1 )); then
+  echo "Erro: encontrei mais de uma partição NTFS no VHDX; não vou escolher uma automaticamente." >&2
+  exit 1
+elif (( ${#partitions[@]} == 0 )) && [[ "$(blkid -s TYPE -o value "$NBD" 2>/dev/null || true)" == "ntfs" ]]; then
+  # Some VHDX files contain a filesystem directly, without a partition table.
+  filesystem_device="$NBD"
+else
+  echo "Erro: não encontrei uma partição NTFS utilizável no VHDX (partições detectadas: ${#partitions[@]})." >&2
+  exit 1
+fi
+
+if ! mount -t ntfs3 -o "$MOUNT_OPTS" "$filesystem_device" "$MEDIA_MNT"; then
+  echo "Erro: não consegui montar $filesystem_device com escrita." >&2
+  exit 1
+fi
+media_mounted_by_us=true
+
+if ! is_rw "$MEDIA_MNT"; then
+  echo "Erro: o NTFS dentro do VHDX ficou somente leitura (volume marcado como sujo)." >&2
+  echo "No Windows: anexe o VHDX, rode chkdsk /f na letra dele e desanexe antes de desligar." >&2
+  exit 1
+fi
+
+success=true
+echo "VHDX montado como leitura e escrita em $MEDIA_MNT."
+echo "Para desmontar com segurança: $0 --umount"
