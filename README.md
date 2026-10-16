@@ -61,7 +61,7 @@ não consegue montar com escrita. O script avisa quando isso acontece.
 ## 2. Instalar no Linux
 
 ```bash
-git clone <url-deste-repo> vhdx-win11-oma
+git clone https://github.com/jwjosefy/vhdx-win11-oma.git
 cd vhdx-win11-oma
 ./install.sh
 ```
